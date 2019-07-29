@@ -7,6 +7,7 @@ extern crate indolentjson;
 extern crate percent_encoding;
 extern crate r2d2_postgres;
 extern crate serde_derive;
+#[macro_use]
 extern crate serde_json;
 extern crate sodiumoxide;
 
