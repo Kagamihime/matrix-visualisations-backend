@@ -1,6 +1,6 @@
 use actix_web::{web, Error, HttpResponse};
 use awc::{Client, JsonBody};
-use futures::{Async, Future};
+use futures::{future, Async, Future};
 use futures_cpupool::CpuPool;
 use serde::Serialize;
 use serde_derive::Deserialize;
@@ -68,54 +68,88 @@ pub fn deepest(
                 ),
             )
             .send()
-            .then(move |response| match response {
-                Ok(mut res) => {
-                    if res.status().is_success() {
-                        let mut json = JsonBody::<_, MakeJoinResponse>::new(&mut res).limit(5000);
+            .and_then(move |mut response| {
+                if response.status().is_success() {
+                    let mut json = JsonBody::<_, MakeJoinResponse>::new(&mut response).limit(5000);
 
-                        match json.poll() {
-                            Ok(json) => match json {
-                                Async::Ready(json) => {
-                                    let pruned_event = prune_event(
-                                        serde_json::to_value(json.event.clone())
-                                            .expect("Failed to serialize"),
-                                    );
+                    match json.poll() {
+                        Ok(json) => match json {
+                            Async::Ready(json) => {
+                                let pruned_event = prune_event(
+                                    serde_json::to_value(json.event.clone())
+                                        .expect("Failed to serialize")
+                                );
 
-                                    let esig = event_signature(&pruned_event, &fd.secret_key);
+                                let esig = event_signature(&pruned_event, &fd.secret_key);
 
-                                    let mut event = json.event;
+                                let mut event = json.event;
 
-                                    event["signatures"].as_object_mut().unwrap().insert(
-                                        fd.server_name.clone(),
-                                        json!({ fd.key_name.clone(): esig }),
-                                    );
+                                event["signatures"].as_object_mut().unwrap().insert(
+                                    fd.server_name.clone(),
+                                    json!({ fd.key_name.clone(): esig }),
+                                );
 
-                                    let path = path.as_str().replace("make", "send");
+                                let path = path.as_str().replace("make", "send");
 
-                                    client
-                                        .put(&format!("http://{}{}", fd.target_addr, path))
-                                        .header(
-                                            "Authorization",
-                                            request_json(
-                                                "PUT",
-                                                &fd.server_name,
-                                                &fd.secret_key,
-                                                &fd.key_name,
-                                                &fd.target_name,
-                                                &path,
-                                                Some(event.clone()),
-                                            ),
+                                client
+                                    .put(&format!("http://{}{}", fd.target_addr, path))
+                                    .header(
+                                        "Authorization",
+                                        request_json(
+                                            "PUT",
+                                            &fd.server_name,
+                                            &fd.secret_key,
+                                            &fd.key_name,
+                                            &fd.target_name,
+                                            &path,
+                                            Some(event.clone()),
+                                        ),
+                                    )
+                                    .send_json(&event)
+                                    .map_err(|_| {
+                                        future::ok(
+                                            HttpResponse::InternalServerError()
+                                                .content_type("application/json")
+                                                .header("Access-Control-Allow-Origin", "*")
+                                                .header("Access-Control-Allow-Methods", "GET, POST")
+                                                .header(
+                                                    "Access-Control-Allow-Headers",
+                                                    "Origin, X-Requested-With, Content-Type, Accept",
+                                                )
+                                                .body("Could not send /send_join request")
                                         )
-                                        .send_json(&event)
-                                        .map_err(|_| ())
-                                        .and_then(|response| {
-                                            println!("Response: {:?}", response);
-                                        }); // FIXME
-
-                                    let response_string = serde_json::to_string(&event)
-                                        .expect("Failed to serialize the response object");
-
-                                    HttpResponse::Ok()
+                                    })
+                                    .map(|response| {
+                                        if response.status().is_success() {
+                                            future::ok(
+                                                HttpResponse::Ok()
+                                                    .content_type("application/json")
+                                                    .header("Access-Control-Allow-Origin", "*")
+                                                    .header("Access-Control-Allow-Methods", "GET, POST")
+                                                    .header(
+                                                        "Access-Control-Allow-Headers",
+                                                        "Origin, X-Requested-With, Content-Type, Accept",
+                                                    )
+                                                    .body("Joined room")
+                                            )
+                                        } else {
+                                            future::ok(
+                                                HttpResponse::Forbidden()
+                                                    .content_type("application/json")
+                                                    .header("Access-Control-Allow-Origin", "*")
+                                                    .header("Access-Control-Allow-Methods", "GET, POST")
+                                                    .header(
+                                                        "Access-Control-Allow-Headers",
+                                                        "Origin, X-Requested-With, Content-Type, Accept",
+                                                    )
+                                                    .body("Joining this room is forbidden")
+                                            )
+                                        }
+                                    })
+                            }
+                            Async::NotReady => {
+                                future::ok(
+                                    HttpResponse::InternalServerError()
                                         .content_type("application/json")
                                         .header("Access-Control-Allow-Origin", "*")
                                         .header("Access-Control-Allow-Methods", "GET, POST")
@@ -123,9 +157,13 @@ pub fn deepest(
                                             "Access-Control-Allow-Headers",
                                             "Origin, X-Requested-With, Content-Type, Accept",
                                         )
-                                        .body(response_string)
-                                }
-                                Async::NotReady => HttpResponse::InternalServerError()
+                                        .body("The JSON object wasn't ready")
+                                )
+                            }
+                        }
+                        Err(e) => {
+                            future::ok(
+                                HttpResponse::InternalServerError()
                                     .content_type("application/json")
                                     .header("Access-Control-Allow-Origin", "*")
                                     .header("Access-Control-Allow-Methods", "GET, POST")
@@ -133,31 +171,24 @@ pub fn deepest(
                                         "Access-Control-Allow-Headers",
                                         "Origin, X-Requested-With, Content-Type, Accept",
                                     )
-                                    .body("The JSON object wasn't ready"),
-                            },
-                            Err(e) => HttpResponse::InternalServerError()
-                                .content_type("application/json")
-                                .header("Access-Control-Allow-Origin", "*")
-                                .header("Access-Control-Allow-Methods", "GET, POST")
-                                .header(
-                                    "Access-Control-Allow-Headers",
-                                    "Origin, X-Requested-With, Content-Type, Accept",
-                                )
-                                .body(&format!("Error with the poll: {}", e)),
-                        }
-                    } else {
-                        HttpResponse::Unauthorized()
-                            .content_type("application/json")
-                            .header("Access-Control-Allow-Origin", "*")
-                            .header("Access-Control-Allow-Methods", "GET, POST")
-                            .header(
-                                "Access-Control-Allow-Headers",
-                                "Origin, X-Requested-With, Content-Type, Accept",
+                                    .body(&format!("Error with the poll: {}", e))
                             )
-                            .body("Unauthorized by the resident HS")
+                        },
                     }
+                } else {
+                    futures::future::ok(HttpResponse::Unauthorized()
+                        .content_type("application/json")
+                        .header("Access-Control-Allow-Origin", "*")
+                        .header("Access-Control-Allow-Methods", "GET, POST")
+                        .header(
+                            "Access-Control-Allow-Headers",
+                            "Origin, X-Requested-With, Content-Type, Accept",
+                        )
+                        .body("Unauthorized by the resident HS"))
                 }
-                Err(_) => HttpResponse::InternalServerError()
+            })
+            .or_else(|_| {
+                future::ok(HttpResponse::InternalServerError()
                     .content_type("application/json")
                     .header("Access-Control-Allow-Origin", "*")
                     .header("Access-Control-Allow-Methods", "GET, POST")
@@ -165,8 +196,8 @@ pub fn deepest(
                         "Access-Control-Allow-Headers",
                         "Origin, X-Requested-With, Content-Type, Accept",
                     )
-                    .body("Could not send /make_join request"),
-            }),
+                    .body("Could not send /make_join request"))
+            })
     )
 }
 
